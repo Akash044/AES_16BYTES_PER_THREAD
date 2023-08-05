@@ -1,12 +1,25 @@
 ﻿#include <stdio.h>
 #include <stdlib.h>
+#include <iostream>
 #include <math.h>
+#include <stdint.h>
 #include <assert.h>
+#include <fstream>
 #include <cuda.h>
 #include <cuda_runtime.h>
-#include <stdint.h>
 #include <device_launch_parameters.h>
 
+
+#define AES_BITS 128
+#define NUM_ROUNDS 10
+#define SUB_KEYS (NUM_ROUNDS + 1)
+#define KEY_BLOCK 16
+#define THREADS_PER_BLOCK 1
+#define ROUNDS 10
+#define SHARED false
+
+__shared__ uint8_t state_array[16];
+__device__ uint8_t expandedKey[176];
 __constant__ uint8_t rcon[10] = { 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1B, 0x36 };
 __constant__ uint8_t s[256] =
 {
@@ -28,8 +41,6 @@ __constant__ uint8_t s[256] =
         0x8C, 0xA1, 0x89, 0x0D, 0xBF, 0xE6, 0x42, 0x68, 0x41, 0x99, 0x2D, 0x0F, 0xB0, 0x54, 0xBB, 0x16
 };
 
-__shared__ uint8_t state_array[16];
-__shared__ uint8_t expandedKey[176];
 
 // Encryption: Multiply by 2 for MixColumns
 __constant__ uint8_t mul2[] =
@@ -89,27 +100,25 @@ __device__ void KeyExpansionCore(uint8_t* in, uint8_t i) {
     in[2] = s[in[2]];
     in[3] = s[in[3]];
 
-    //printf("\ni = %x \n", i);
-
     // RCon
     in[0] ^= rcon[i];
 }
 
 
-__device__ void KeyExpansion(uint8_t* inputKey, uint8_t* expandedKeys) {
+__global__ void KeyExpansion(uint8_t* inputKey) {
  
     for (int i = 0; i < 16; i++) {
-        expandedKeys[i] = inputKey[i];
+        expandedKey[i] = inputKey[i];
     }
 
     int bytesGenerated = 16;
     int rconIteration = 0;
-    uint8_t tmpCore[4];
+    uint8_t tmpCore[4] = {0x00};
 
     while (bytesGenerated < 176) {
     
         for (int i = 0; i < 4; i++) {
-            tmpCore[i] = expandedKeys[i + bytesGenerated - 4]; //Word 3 (w3): b12b13b14b15
+            tmpCore[i] = expandedKey[i + bytesGenerated - 4]; //Word 3 (w3): b12b13b14b15
         }
 
         if (bytesGenerated % 16 == 0) {
@@ -117,27 +126,17 @@ __device__ void KeyExpansion(uint8_t* inputKey, uint8_t* expandedKeys) {
         }
 
         for (uint8_t a = 0; a < 4; a++) {
-            expandedKeys[bytesGenerated] = expandedKeys[bytesGenerated - 16] ^ tmpCore[a];
+            expandedKey[bytesGenerated] = expandedKey[bytesGenerated - 16] ^ tmpCore[a];
             bytesGenerated++;
         }
-
-    }
-    printf("expanded key\n");
-    for (int i = 16; i < 32; i++) {
-        printf("%x ", expandedKeys[i]);
     }
 }
 
 
 __device__ void AddRoundKey(uint8_t* state, uint8_t* roundKey) {
-
-    //printf("\n----------------------------start here--------------------------------\n");
     for (int i = 0; i < 16; i++) {
-        //printf("\n%x %x ", state[i], roundKey[i]);
         state[i] ^= roundKey[i];
-        //printf("= %x \n", state[i]);
     }
-
 }
 
 __device__ void SubBytes(uint8_t* state) {
@@ -147,7 +146,7 @@ __device__ void SubBytes(uint8_t* state) {
 }
 
 __device__ void ShiftRows(uint8_t* state) {
-    uint8_t tmp[16];
+    uint8_t tmp[16] = {0x00};
 
     /* Column 1 */
     tmp[0] = state[0];
@@ -180,7 +179,7 @@ __device__ void ShiftRows(uint8_t* state) {
 
 
 __device__ void MixColumns(uint8_t* state) {                                                                                                                                                            
-    uint8_t tmp[16];
+    uint8_t tmp[16] = {0x00};
 
     tmp[0] = (uint8_t)mul2[state[0]] ^ mul3[state[1]] ^ state[2] ^ state[3];
     tmp[1] = (uint8_t)state[0] ^ mul2[state[1]] ^ mul3[state[2]] ^ state[3];
@@ -221,73 +220,119 @@ __device__ void FinalRound(uint8_t* state, uint8_t* key) {
 }
 
 
-__global__ void AESEncrypt(uint8_t* message, uint8_t* inputKey, uint8_t* encryptedMessage) {
-    uint8_t state[16];
-
-    for (int i = 0; i < 16; i++) {
-        state[i] = message[i];
-    }
-
+__global__ void AESEncrypt(uint8_t* message, uint8_t* encryptedMessage) {
+    uint8_t state[16] = {0x00};
     int numberOfRounds = 9;
+    int id = (threadIdx.x + blockIdx.x * blockDim.x);
 
-    KeyExpansion(inputKey, expandedKey); //key expansion
+    printf("%d \n",blockIdx.x);
+
+    /*long int j;
+    #pragma unroll
+    for (j = 0; j < 16; j++) {
+        state[j] = message[j+id];
+    }
 
     AddRoundKey(state, expandedKey); // Initial round
 
+    #pragma unroll
     for (int i = 0; i < numberOfRounds; i++) {
         Round(state, expandedKey + (16 * (i + 1)));
     }
 
     FinalRound(state, expandedKey + 160);
 
-
+    #pragma unroll
     for (int i = 0; i < 16; i++) {
-        encryptedMessage[i] = state[i];
-    }
+        encryptedMessage[i + id] = state[i];
+    }*/
 }
+
+
 int main()
 {
-   uint8_t input[16] =   {0x73, 0x65, 0x63, 0x72,
-                          0x65, 0x74, 0x6d, 0x65,
-                          0x73, 0x73, 0x61, 0x67,
-                          0x65, 0x6e, 0x6f, 0x77}; /* input data here */
-   uint8_t key[16] =    {0x73, 0x61, 0x74, 0x69,
-                        0x73, 0x68, 0x63, 0x6a, 
-                        0x69, 0x73, 0x62, 0x6f,
-                        0x72, 0x69, 0x6e, 0x67 }; /* cipher key here */ 
+    FILE* fp_input;
+    fp_input = fopen("novel.txt", "rb");
+
+    fseek(fp_input, 0L, SEEK_END);
+    long int filesize = ftell(fp_input);
+
+    uint8_t* plaintexts = (uint8_t*)malloc(sizeof(uint8_t) * filesize);
+    fseek(fp_input, 0L, SEEK_SET);
+
+    unsigned long input_cnt = 0;
+    while (feof(fp_input) == 0)
+    {
+        plaintexts[input_cnt] = fgetc(fp_input);
+        input_cnt++;
+    }
+    fclose(fp_input);
+
+    char key[16] = { 0x73, 0x61, 0x74, 0x69,
+                     0x73, 0x68, 0x63, 0x6a,
+                     0x69, 0x73, 0x62, 0x6f,
+                     0x72, 0x69, 0x6e, 0x67 };
+
+
+    // Define launch config
+    int chunks = filesize / KEY_BLOCK;
+    int ThreadsPerBlock = THREADS_PER_BLOCK;
+    int Blocks = ceil(chunks / ThreadsPerBlock);
    
 
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
 
-
-    uint8_t output[16];
-
-
-    uint8_t* d_input;
-    uint8_t* d_output;
     uint8_t* d_key;
-
-    cudaMalloc(&d_input, sizeof(input));
-    cudaMalloc(&d_output, sizeof(output));
     cudaMalloc(&d_key, sizeof(key));
-
-    cudaMemcpy(d_input, input, sizeof(input), cudaMemcpyHostToDevice);
     cudaMemcpy(d_key, key, sizeof(key), cudaMemcpyHostToDevice);
 
+    KeyExpansion << <1, 1 >> > (d_key); //key expansion
+    cudaDeviceSynchronize();
 
-    AESEncrypt << <1, 1 >> > (d_input, d_key, d_output);
+    uint8_t* output = (uint8_t*)malloc(sizeof(uint8_t) * filesize);
+    uint8_t* d_input;
+    uint8_t* d_output;
 
-    cudaDeviceSynchronize(); // Wait for kernel to complete
+    cudaMalloc(&d_input, filesize * sizeof(unsigned char));
+    cudaMalloc(&d_output, filesize * sizeof(unsigned char));
 
-    cudaMemcpy(output, d_output, sizeof(output), cudaMemcpyDeviceToHost);
-    
-    printf("\noutput message\n ");
-    for (int i = 0; i < 16; i++) {
+
+    cudaMemcpy(d_input, plaintexts, filesize * sizeof(unsigned char), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_key, key, sizeof(key), cudaMemcpyHostToDevice);
+   
+    // Record the start event
+    cudaEventRecord(start, 0);
+
+    AESEncrypt << <Blocks, THREADS_PER_BLOCK >> > (d_input, d_output);
+    cudaDeviceSynchronize();
+
+    // Record the stop event
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize(stop);
+
+    cudaMemcpy(output, d_output, filesize * sizeof(unsigned char), cudaMemcpyDeviceToHost);
+
+    /*printf("\noutput message\n ");
+    for (int i = 16; i < 48; i++) {
         printf("%x ", output[i]);
-    }
+    }*/
 
     cudaFree(d_input);
     cudaFree(d_output);
     cudaFree(d_key);
+  
+    // Calculate the elapsed time
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+
+    // Print the elapsed time
+    printf("%.2fms\n", milliseconds);
+
+    // Destroy CUDA events
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
 
     return 0;
 }
