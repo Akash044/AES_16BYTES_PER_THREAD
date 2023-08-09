@@ -8,18 +8,19 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
+//#include<algorithm>
+int d = std::max(1, 2);
 
+//#define AES_BITS 128
+//#define NUM_ROUNDS 10
+//#define SUB_KEYS (NUM_ROUNDS + 1)
+//#define KEY_BLOCK 16
+//#define THREADS_PER_BLOCK 1
+//#define ROUNDS 10
+//#define SHARED false
 
-#define AES_BITS 128
-#define NUM_ROUNDS 10
-#define SUB_KEYS (NUM_ROUNDS + 1)
-#define KEY_BLOCK 16
-#define THREADS_PER_BLOCK 1
-#define ROUNDS 10
-#define SHARED false
-
-__shared__ uint8_t state_array[16];
-__device__ uint8_t expandedKey[176];
+//__shared__ uint8_t state[16];
+__constant__ uint8_t expandedKey[176];
 __constant__ uint8_t rcon[10] = { 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1B, 0x36 };
 __constant__ uint8_t s[256] =
 {
@@ -178,7 +179,7 @@ __device__ void ShiftRows(uint8_t* state) {
 }
 
 
-__device__ void MixColumns(uint8_t* state) {                                                                                                                                                            
+__device__ void MixColumns(uint8_t* state) {
     uint8_t tmp[16] = {0x00};
 
     tmp[0] = (uint8_t)mul2[state[0]] ^ mul3[state[1]] ^ state[2] ^ state[3];
@@ -221,16 +222,17 @@ __device__ void FinalRound(uint8_t* state, uint8_t* key) {
 
 
 __global__ void AESEncrypt(uint8_t* message, uint8_t* encryptedMessage) {
-    uint8_t state[16] = {0x00};
+    register uint8_t state[16];
     int numberOfRounds = 9;
-    int id = (threadIdx.x + blockIdx.x * blockDim.x);
 
-    printf("%d \n",blockIdx.x);
+    int id = (blockDim.x * blockIdx.x + threadIdx.x);
+    //printf("%d %d\n", id, blockIdx.x);
 
-    /*long int j;
+    long int j;
     #pragma unroll
     for (j = 0; j < 16; j++) {
         state[j] = message[j+id];
+        //printf("%x ", message[j + id]);
     }
 
     AddRoundKey(state, expandedKey); // Initial round
@@ -244,8 +246,9 @@ __global__ void AESEncrypt(uint8_t* message, uint8_t* encryptedMessage) {
 
     #pragma unroll
     for (int i = 0; i < 16; i++) {
-        encryptedMessage[i + id] = state[i];
-    }*/
+        encryptedMessage[i+id] = state[i];
+    }
+    //*/
 }
 
 
@@ -256,7 +259,7 @@ int main()
 
     fseek(fp_input, 0L, SEEK_END);
     long int filesize = ftell(fp_input);
-
+    //printf("\n%ld \n", filesize);
     uint8_t* plaintexts = (uint8_t*)malloc(sizeof(uint8_t) * filesize);
     fseek(fp_input, 0L, SEEK_SET);
 
@@ -275,17 +278,16 @@ int main()
 
 
     // Define launch config
-    int chunks = filesize / KEY_BLOCK;
-    int ThreadsPerBlock = THREADS_PER_BLOCK;
-    int Blocks = ceil(chunks / ThreadsPerBlock);
-   
+    int bytePerThread = 16;
+    int threadsPerBlock = 1024;
+    int blocks = ceil(filesize / (threadsPerBlock * bytePerThread));
 
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
     uint8_t* d_key;
-    cudaMalloc(&d_key, sizeof(key));
+    cudaMalloc((void**)&d_key, sizeof(key));
     cudaMemcpy(d_key, key, sizeof(key), cudaMemcpyHostToDevice);
 
     KeyExpansion << <1, 1 >> > (d_key); //key expansion
@@ -295,8 +297,8 @@ int main()
     uint8_t* d_input;
     uint8_t* d_output;
 
-    cudaMalloc(&d_input, filesize * sizeof(unsigned char));
-    cudaMalloc(&d_output, filesize * sizeof(unsigned char));
+    cudaMalloc((void**)&d_input, filesize * sizeof(unsigned char));
+    cudaMalloc((void**)&d_output, filesize * sizeof(unsigned char));
 
 
     cudaMemcpy(d_input, plaintexts, filesize * sizeof(unsigned char), cudaMemcpyHostToDevice);
@@ -305,7 +307,7 @@ int main()
     // Record the start event
     cudaEventRecord(start, 0);
 
-    AESEncrypt << <Blocks, THREADS_PER_BLOCK >> > (d_input, d_output);
+    AESEncrypt << <blocks, threadsPerBlock >> > (d_input, d_output);
     cudaDeviceSynchronize();
 
     // Record the stop event
@@ -313,11 +315,11 @@ int main()
     cudaEventSynchronize(stop);
 
     cudaMemcpy(output, d_output, filesize * sizeof(unsigned char), cudaMemcpyDeviceToHost);
-
-    /*printf("\noutput message\n ");
-    for (int i = 16; i < 48; i++) {
+   /*
+    printf("\noutput message\n ");
+    for (int i = 0; i < 16; i++) {
         printf("%x ", output[i]);
-    }*/
+    }//*/
 
     cudaFree(d_input);
     cudaFree(d_output);
